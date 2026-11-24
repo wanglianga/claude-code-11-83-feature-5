@@ -66,6 +66,7 @@
   <label>标识<input id="id" value="C1" placeholder="C1 / R7 / S17 / O2"></label>
   <button onclick="load()">查询证据链</button>
   <button style="background:#475569" onclick="rebuild()">重建投影并核验</button>
+  <button style="background:#7c3aed" onclick="traceDemo()">三工厂样例 · 推导污染候选</button>
 </div>
 <div class="quick">
   快捷样例：
@@ -204,6 +205,68 @@ async function rebuild() {
 }
 
 document.getElementById('id').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+
+function candidateTags(c) {
+  const tags = [];
+  if (c.scopeExpanded) tags.push('<span class="tag QUARANTINED">范围扩张</span>');
+  if (c.viaMissingRecord) tags.push('<span class="tag PENDING">缺失批次记录</span>');
+  if (c.fingerprintUnknown) tags.push('<span class="tag PENDING">指纹未知</span>');
+  if (c.singleObservation) tags.push('<span class="tag UNKNOWN">单次阳性</span>');
+  return tags.join(' ');
+}
+
+function traceTable(r) {
+  if (!r.candidates || !r.candidates.length) return '<p class="muted">无候选</p>';
+  return '<table><tr><th>#</th><th>原料批次</th><th>辅料</th><th>供应商</th>'
+    + '<th>得分</th><th>后验(概率模式)</th><th>支持样品</th><th>标记</th><th>状态</th></tr>'
+    + r.candidates.map(c => '<tr><td>' + c.rank + '</td><td><b>' + esc(c.rawBatchId) + '</b></td><td>'
+      + esc(c.ingredientCode) + '</td><td>' + esc(c.supplierId) + '</td><td>'
+      + esc(c.score) + '</td><td>' + esc(c.posterior) + '</td><td>' + esc((c.supportedBy || []).join(', '))
+      + '</td><td>' + candidateTags(c) + '</td><td>' + tag(c.status) + '</td></tr>').join('') + '</table>';
+}
+
+function traceCard(title, r) {
+  let html = '<div class="card"><h2>' + esc(title) + '</h2>';
+  html += '<p class="muted">状态 <b>' + esc(r.status) + '</b> ｜ 阳性样品 ' + r.positiveSamples
+    + ' ｜ 候选 ' + r.candidateCount + ' ｜ 法律责任认定：<b>' + (r.legalLiability ? '是' : '否（仅待调查候选）') + '</b></p>';
+  html += '<div class="err" style="background:#fef3c7;color:#92400e">' + esc(r.disclaimer) + '</div>';
+  html += traceTable(r);
+  if (r.pruned && r.pruned.length) {
+    html += '<h2 style="margin-top:16px">被硬约束剪枝</h2><table><tr><th>批次</th><th>原因</th><th>证据</th></tr>'
+      + r.pruned.map(p => '<tr><td><b>' + esc(p.rawBatchId) + '</b></td><td>' + esc(p.reason)
+        + '</td><td>' + esc((p.evidence || []).join('；')) + '</td></tr>').join('') + '</table>';
+  }
+  if (r.unresolved && r.unresolved.length) {
+    html += '<h2 style="margin-top:16px">未解释阳性样品</h2><table><tr><th>样品</th><th>成品批次</th><th>原因</th></tr>'
+      + r.unresolved.map(u => '<tr><td><b>' + esc(u.sampleKey) + '</b></td><td>' + esc(u.productBatchId)
+        + '</td><td>' + esc(u.reason) + '</td></tr>').join('') + '</table>';
+  }
+  if (r.sharedSupplierGroups && r.sharedSupplierGroups.length) {
+    html += '<h2 style="margin-top:16px">共用供应商（仅采购渠道，非责任依据）</h2><table><tr><th>供应商</th><th>相关批次</th><th>涉及工厂</th><th>说明</th></tr>'
+      + r.sharedSupplierGroups.map(g => '<tr><td><b>' + esc(g.supplierId) + '</b></td><td>'
+        + esc((g.rawBatches || []).join(', ')) + '</td><td>' + esc((g.factories || []).join(', '))
+        + '</td><td>' + esc(g.note) + '</td></tr>').join('') + '</table>';
+  }
+  html += '</div>';
+  return html;
+}
+
+async function traceDemo() {
+  document.getElementById('out').innerHTML = '<div class="card">正在导入三工厂样例并推导候选…</div>';
+  try {
+    await api('/api/trace/demo/seed', { method: 'POST' });
+    const constraint = await api('/api/trace/evaluate', { method: 'POST', body: JSON.stringify({ analyte: 'LEAD' }) });
+    const noFp = await api('/api/trace/evaluate', { method: 'POST', body: JSON.stringify({ analyte: 'LEAD', useFingerprint: false }) });
+    const prob = await api('/api/trace/evaluate', { method: 'POST', body: JSON.stringify({ analyte: 'LEAD', mode: 'PROBABILISTIC' }) });
+    let html = traceCard('① 硬约束交集（时间可达 + 指纹相容）', constraint);
+    html += traceCard('② 关闭指纹证据（仅时间可达，范围扩张）', noFp);
+    html += traceCard('③ 概率来源模型（依赖背景污染率假设）', prob);
+    html += '<div class="card"><h2>原始 JSON（硬约束模式）</h2><pre>' + esc(JSON.stringify(constraint, null, 2)) + '</pre></div>';
+    document.getElementById('out').innerHTML = html;
+  } catch (e) {
+    document.getElementById('out').innerHTML = '<div class="err">推导失败：' + esc(e.message) + '</div>';
+  }
+}
 </script>
 </body>
 </html>

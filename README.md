@@ -1,6 +1,7 @@
 # 省食品安全平台 · 报文交换服务
 
-监管机构、抽样单位、实验室和处置部门之间交换抽样单、检测报告、复检修订及处置回执的后端服务。
+监管机构、抽样单位、实验室和处置部门之间交换抽样单、检测报告、复检修订及处置回执的后端服务；
+并提供**食品污染源头候选推导**（样品账/污染谱账/生产图 → 待调查候选与反证，非责任认定）。
 技术栈：**Java 21 编译目标 / JDK 25 运行、Spring Boot 3.5、Spring Data JPA、PostgreSQL 18、springdoc-openapi**。
 
 ---
@@ -81,6 +82,34 @@
 对应接口：`GET /api/reconciliation/containers/{id}`、`/reports/{no}`、`/samples/{key}`、`/operations/{no}` 串联：
 不可变信封（摘要/签名/规范/接收时间）→ 样品 → 报告修订（状态/摘要/supersedes）→ 操作号 → 回执，并附完整事件序列。
 
+### 1.9 食品污染源头候选推导（`/api/trace/**`）
+
+多个地区同时检出相同污染物时，监管需要把有限追溯范围缩到**可能的原料批次**，而不能因共同供应商就直接认定同源。
+本模块沿「样品 → 成品批次 → 生产线 → 配方投料 → 原料批次」求值，输出**待调查候选**，不是责任认定。
+
+| 账/图 | 表 | 关键字段 |
+| --- | --- | --- |
+| 样品账 | `trace_sample` | 样品键 → 成品批次、采样时间 |
+| 生产图 | `trace_factory` / `trace_line` / `trace_product_batch` | 工厂、生产线、成品批次生产区间 |
+| 原料与配方 | `trace_raw_batch` / `trace_usage` | 供应商、采购/到货区间、参考指纹；投料记录与投料区间（`raw_batch_id` 可空=记录缺失） |
+| 污染谱账 | `trace_spectrum` | 化学指纹、检出限 + 单位、检测相对不确定度、结果值、极性（阳性/阴性） |
+| 追溯版本 | `trace_version` | 冻结的生产图 + 实验结果 + 候选输出 + 三段 SHA-256；触发器禁止改删 |
+
+**路径求值器**（`TraceEvaluator`）先做硬约束交集再排序：
+
+1. **时间可达性**：原料采购起始/到货起始晚于投料结束（或缺投料结束则取成品批次生产结束）→ 不可达，剪枝。
+2. **指纹相容度**：余弦相似度 ≥ `1-(容差+检测相对不确定度)`（阈值裁剪到 `[0.40,0.95]`）；低于阈值 → 指纹不符，剪枝。指纹缺失视为未知、不剪枝。
+3. **边界信息缺失**：采购/到货时间边界缺失时不强行剪枝，而是放宽候选并标记（易解释但候选偏宽）。
+4. **缺失批次记录**：投料记录未登记原料批次时，按同辅料展开到时间可达的候选批次，标记 `scopeExpanded`（范围扩张）。
+5. **阴性反证**：阴性样品削弱其可达批次的排序，但单次阴性不剪枝。
+
+两种模式：
+
+- `CONSTRAINT`（硬约束交集）：先剔除不可能批次，再按证据强度排序——易解释，但边界信息缺失时候选会很宽。
+- `PROBABILISTIC`（概率来源模型）：以背景污染率为先验/似然基准，结合指纹相似度与阴性观测给候选相对后验权重——能排序部分证据，但依赖可靠的背景污染率（未显式给出时用默认值并在 `assumptions` 中标注）。
+
+**输出约束**：每个候选状态恒为 `CANDIDATE_FOR_INVESTIGATION` 且 `legalLiability=false`；单次阳性、缺失记录、共用供应商均明确标注，**任何单一共享供应商或单次阳性都不得被写成确定责任**。结果可冻结为不可变**追溯版本**（固定生产图与实验结果），供风险沟通与复现，不用于法律定责。
+
 ---
 
 ## 2. 一键启动
@@ -144,7 +173,7 @@ java -jar target/message-exchange-1.0.0.jar
 
 样例：容器 **C1** 含样品 **S17**、报告 **R7** 修订 **1**，操作 **O1** 已受理；复检**修订2**显式取代修订1，以 **O2** 发送后目标超时；再次处理 O2 时**先查询**而不新建操作，目标已受理则本地收敛；旧容器 **C1 重传不回滚**；**修订3** 使用新批次生效的 **XML2** 规范，仍按新容器固定的规范解析。
 
-### 4.1 自动化端到端验证脚本（55 项断言）
+### 4.1 自动化端到端验证脚本（82 项断言）
 
 服务启动并使用**空数据库**后：
 
@@ -154,7 +183,7 @@ chmod +x verify.sh
 ./verify.sh http://localhost:8080
 ```
 
-脚本自动完成上述全部场景，并额外验证：操作号三种幂等/冲突语义、异号同摘要重复到达、并行结论隔离、晚到旧修订、同修订摘要冲突、无效签名、未知附件引用、检出限单位缺失、`RECEIVED` 与 `DISPOSAL_CONFIRMED` 回执区分、重放时点窗口、重放/投影一致、投影重建差异报告、四类对账证据链。退出码 `0` 表示全部通过。
+脚本自动完成上述全部场景，并额外验证：操作号三种幂等/冲突语义、异号同摘要重复到达、并行结论隔离、晚到旧修订、同修订摘要冲突、无效签名、未知附件引用、检出限单位缺失、`RECEIVED` 与 `DISPOSAL_CONFIRMED` 回执区分、重放时点窗口、重放/投影一致、投影重建差异报告、四类对账证据链；以及**三工厂共用供应商样例**的污染源头候选推导（见 4.3）。退出码 `0` 表示全部通过。
 
 > 重复运行脚本前请清空业务表（脚本假定全新状态）：
 > ```sql
@@ -162,9 +191,11 @@ chmod +x verify.sh
 >   report_head_projection, operation_ledger, receipt,
 >   target_inbox, target_receipt RESTART IDENTITY CASCADE;
 > UPDATE fault_switch SET timeout_next = FALSE WHERE id = 1;
+> TRUNCATE trace_version, trace_spectrum, trace_sample, trace_usage,
+>   trace_raw_batch, trace_product_batch, trace_line, trace_factory CASCADE;
 > ```
 
-### 4.2 JUnit 集成测试（21 个，真实 PostgreSQL + 随机端口）
+### 4.2 JUnit 集成测试（27 个，真实 PostgreSQL + 随机端口）
 
 ```bash
 mvn test
@@ -175,9 +206,46 @@ mvn test
 - `ScenarioFlowTest`：题面完整样例 + 重放/投影/重建一致性；
 - `ValidationCorrelationTest`：检出限单位缺失、坏签名、未知附件、规范版本单位词表、并行隔离、晚到修订、修订冲突、容器载荷冲突、未知批次/发送方；
 - `DeliveryIdempotencyTest`：同号同载荷、同号异载荷冲突、异号同摘要重复、未知→查询收敛、目标未收到时原号重发、两类回执、隔离修订不可投递；
-- `ProjectionRebuildTest`：重放时点窗口、投影漂移→重建报告差异并修复、不可变触发器拒绝 UPDATE/DELETE、样品键隔离。
+- `ProjectionRebuildTest`：重放时点窗口、投影漂移→重建报告差异并修复、不可变触发器拒绝 UPDATE/DELETE、样品键隔离；
+- `TraceSourcingTest`（6 个）：三工厂共用供应商样例的时间剪枝与指纹剪枝、指纹证据增减对候选排序/范围的影响、缺失批次记录造成的范围扩张与补登收敛、追溯版本冻结与仅凭冻结输入复现、结果时点窗口、非法模式拒绝。
 
-### 4.3 手工快速体验
+### 4.3 三工厂共用供应商样例：污染源头候选推导
+
+`POST /api/trace/demo/seed` 导入样例（对账页顶部「三工厂样例 · 推导污染候选」按钮同效）：
+
+- 工厂 F1/F2/F3 各一条生产线，共用辅料供应商 `SUP-SHARED`；
+- `RB-STARCH-OK`：两厂在污染可能到达时间内**使用的同一原料批次**（F1 样品 S-PB1、F2 样品 S-PB2 均阳性）；
+- `RB-STARCH-LATE`：同供应商但**到货晚于投料**——应被**时间可达性剪枝**；
+- `RB-STARCH-OTHER`：F3 使用相同辅料，但**指纹与污染谱不符**——应被**指纹相容度剪枝**，其阳性样品 S-PB3 列为未解释（`ALL_PATHS_PRUNED`）；
+- F2 一条辅料投料**未登记原料批次**——按同辅料展开，造成**候选范围扩张**（`SCOPE_EXPANDED`），补登后收敛。
+
+```bash
+# 导入样例
+curl -u admin:admin123 -X POST http://localhost:8080/api/trace/demo/seed
+
+# 硬约束模式：时间 + 指纹剪枝后排序
+curl -u admin:admin123 -H 'Content-Type: application/json' -d '{"analyte":"LEAD"}' \
+  http://localhost:8080/api/trace/evaluate
+
+# 关闭指纹证据：指纹不符批次重新进入候选，数量增加（对比指纹证据的增减效应）
+curl -u admin:admin123 -H 'Content-Type: application/json' -d '{"analyte":"LEAD","useFingerprint":false}' \
+  http://localhost:8080/api/trace/evaluate
+
+# 概率来源模型（依赖背景污染率假设）
+curl -u admin:admin123 -H 'Content-Type: application/json' \
+  -d '{"analyte":"LEAD","mode":"PROBABILISTIC","backgroundRate":0.05}' \
+  http://localhost:8080/api/trace/evaluate
+
+# 冻结追溯版本（固定生产图 + 实验结果 + 候选输出）并复现校验
+V=$(curl -s -u admin:admin123 -H 'Content-Type: application/json' \
+  -d '{"analyte":"LEAD","purpose":"RISK_COMMUNICATION"}' \
+  http://localhost:8080/api/trace/cases/CASE-LEAD-0326/versions | python3 -c 'import json,sys;print(json.load(sys.stdin)["versionId"])')
+curl -u admin:admin123 http://localhost:8080/api/trace/cases/CASE-LEAD-0326/versions/$V/verify
+```
+
+期望：`RB-STARCH-OK` 为双样品支持的首位候选；`RB-STARCH-LATE` 记 `TIME_UNREACHABLE`、`RB-STARCH-OTHER` 记 `FINGERPRINT_INCOMPATIBLE`；所有候选 `status=CANDIDATE_FOR_INVESTIGATION`、`legalLiability=false`，共用供应商分组说明“不构成同源”。
+
+### 4.4 手工快速体验
 
 ```bash
 # 1) 构造 C1 的 CSV 并签名
@@ -222,6 +290,12 @@ curl -u admin:admin123 -X POST http://localhost:8080/api/deliveries/O2/retry
 | `GET  /api/reconciliation/samples/{key}` | 样品证据链 |
 | `GET  /api/reconciliation/operations/{op}` | 操作号证据链 |
 | `GET  /api/meta/spec-versions` | 规范版本/批次/单位词表 |
+| `POST /api/trace/evaluate` · `GET /api/trace/evaluate` | 污染源头候选推导（`mode=CONSTRAINT|PROBABILISTIC`，`useFingerprint`，`backgroundRate`，`asOf`） |
+| `POST /api/trace/cases/{caseId}/versions` | 求值并冻结追溯版本（生产图 + 实验结果 + 候选输出） |
+| `GET  /api/trace/cases/{caseId}/versions[/{vid}]` · `GET /api/trace/versions` | 读取/列出追溯版本 |
+| `GET  /api/trace/cases/{caseId}/versions/{vid}/verify` | 仅凭冻结输入复现候选，与冻结输出比对 |
+| `GET  /api/trace/graph` | 生产图与污染谱概览 |
+| `POST /api/trace/demo/seed` · `/demo/reset` · `/demo/backfill-usage` | 三工厂样例导入/清空/补登缺失批次记录 |
 | `POST /target/deliveries` · `GET /target/deliveries/{op}` | 模拟目标端（幂等接收/查询） |
 | `POST /target/faults` · `GET /target/inbox` · `POST /target/reset` | 故障注入与检视 |
 
@@ -229,6 +303,6 @@ curl -u admin:admin123 -X POST http://localhost:8080/api/deliveries/O2/retry
 
 ## 6. 本环境实际验证结论
 
-- `mvn compile` / `mvn test`：**21 个集成测试全部通过，0 失败 0 错误**（真实连接 `127.0.0.1:5432/ccdev` PostgreSQL 18.1）；`mvn package` 同样通过。
-- 开发态启动后执行 `./verify.sh http://localhost:18080`：**55 项端到端断言全部通过**；最终交付 jar（`java -jar target/message-exchange-1.0.0.jar`，8080 端口）启动后再次执行 `./verify.sh`（默认地址）：**55/55 全部通过，退出码 0**。对账页 `/`、Swagger UI、OpenAPI JSON 均实测返回 200。
+- `mvn compile` / `mvn test`：**27 个集成测试全部通过，0 失败 0 错误**（真实连接 `127.0.0.1:5432/ccdev` PostgreSQL 18.1）；`mvn package` 同样通过。其中新增 `TraceSourcingTest` 6 个（时间/指纹剪枝、指纹证据增减、缺失记录范围扩张与补登收敛、追溯版本冻结与复现、时点窗口、非法模式拒绝）。
+- 交付 jar（`java -jar target/message-exchange-1.0.0.jar`，本环境以 `SERVER_PORT=18081` 启动）在**空数据库**上执行 `./verify.sh http://localhost:18081`：**82 项端到端断言全部通过，退出码 0**（原 55 项 + 新增 27 项污染源头推导断言）。对账页 `/`、Swagger UI、OpenAPI JSON（含 `/api/trace/**` 路径）均实测返回 200。
 - 工作区环境**未安装 Docker**（`docker` 命令不存在），因此 `Dockerfile` 与 `docker-compose.yml` 已按一键启动要求交付，但**镜像构建与 compose 启动未在本环境实际执行**；上述结论均来自本地 JDK 25 + Maven + 预装 PostgreSQL 的真实运行。在装有 Docker 的环境执行 `docker compose up --build` 即可获得等价运行环境。

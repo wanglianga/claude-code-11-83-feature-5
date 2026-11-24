@@ -32,6 +32,11 @@ public class ImmutabilityGuardConfig {
           CREATE OR REPLACE TRIGGER trg_business_event_immutable
             BEFORE UPDATE OR DELETE ON business_event
             FOR EACH ROW EXECUTE FUNCTION forbid_mutation()""");
+      // 追溯版本冻结后不可修改/删除：风险沟通所依据的生产图与实验结果必须可复现
+      jdbc.execute("""
+          CREATE OR REPLACE TRIGGER trg_trace_version_immutable
+            BEFORE UPDATE OR DELETE ON trace_version
+            FOR EACH ROW EXECUTE FUNCTION forbid_mutation()""");
     };
   }
 }

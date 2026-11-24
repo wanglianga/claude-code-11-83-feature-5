@@ -226,6 +226,54 @@ R=$(curl -s -u "$AUTH" "$BASE/api/reconciliation/samples/S17")
 check "S17 证据链含报告 R7" "$(echo "$R" | jval "[h['reportNo'] for h in d['heads']]")" "['R7']"
 
 say ""
+say "============== 污染源头候选推导（三工厂共用供应商样例） =============="
+R=$(curl -s -u "$AUTH" -X POST "$BASE/api/trace/demo/seed")
+check "样例导入：3 家工厂" "$(echo "$R" | jval "d['graph']['factories']")" "3"
+
+R=$(curl -s -u "$AUTH" -X POST -H 'Content-Type: application/json' -d '{"analyte":"LEAD"}' "$BASE/api/trace/evaluate")
+check "候选推导恒为待调查候选（非法责任认定）" "$(echo "$R" | jval "d['legalLiability']")" "False"
+check "阳性样品 3 个" "$(echo "$R" | jval "d['positiveSamples']")" "3"
+check "时间剪枝：晚到批次不可达" "$(echo "$R" | jval "sorted(p['rawBatchId'] for p in d['pruned'] if p['reason']=='TIME_UNREACHABLE')")" "['RB-STARCH-LATE']"
+check "指纹剪枝：第三家同辅料批次不符" "$(echo "$R" | jval "sorted(p['rawBatchId'] for p in d['pruned'] if p['reason']=='FINGERPRINT_INCOMPATIBLE')")" "['RB-STARCH-OTHER']"
+check "第三家样品因全路径被剪枝而无法解释" "$(echo "$R" | jval "d['unresolved'][0]['reason']")" "ALL_PATHS_PRUNED"
+check "两厂共用批次位列候选首位" "$(echo "$R" | jval "d['candidates'][0]['rawBatchId']")" "RB-STARCH-OK"
+check "首位候选由两个样品支持" "$(echo "$R" | jval "len(d['candidates'][0]['supportedBy'])")" "2"
+check "首位候选非单次阳性" "$(echo "$R" | jval "d['candidates'][0]['singleObservation']")" "False"
+check "缺失批次记录导致范围扩张" "$(echo "$R" | jval "d['status']")" "SCOPE_EXPANDED"
+check "展开候选标记缺失批次记录" "$(echo "$R" | jval "any(c['viaMissingRecord'] for c in d['candidates'])")" "True"
+check "共用供应商分组含三家工厂" "$(echo "$R" | jval "[len(g['factories']) for g in d['sharedSupplierGroups'] if g['supplierId']=='SUP-SHARED'][0]")" "3"
+check "共用供应商说明不构成同源" "$(echo "$R" | jval "'不构成同源' in [g['note'] for g in d['sharedSupplierGroups'] if g['supplierId']=='SUP-SHARED'][0]")" "True"
+CONSTRAINT_N=$(echo "$R" | jval "d['candidateCount']")
+
+R=$(curl -s -u "$AUTH" -X POST -H 'Content-Type: application/json' -d '{"analyte":"LEAD","useFingerprint":false}' "$BASE/api/trace/evaluate")
+NOFP_N=$(echo "$R" | jval "d['candidateCount']")
+check "关闭指纹证据后候选范围扩张" "$([ "$NOFP_N" -gt "$CONSTRAINT_N" ] && echo yes || echo no)" "yes"
+check "关闭指纹证据后指纹不符批次进入候选" "$(echo "$R" | jval "'RB-STARCH-OTHER' in [c['rawBatchId'] for c in d['candidates']]")" "True"
+
+R=$(curl -s -u "$AUTH" -X POST -H 'Content-Type: application/json' -d '{"analyte":"LEAD","mode":"PROBABILISTIC","backgroundRate":0.05}' "$BASE/api/trace/evaluate")
+check "概率模式首位同为两厂共用批次" "$(echo "$R" | jval "d['candidates'][0]['rawBatchId']")" "RB-STARCH-OK"
+check "概率模式给出后验权重" "$(echo "$R" | jval "d['candidates'][0]['posterior'] > 0")" "True"
+check "概率模式标明背景污染率非默认" "$(echo "$R" | jval "d['assumptions']['backgroundRateDefaulted']")" "False"
+
+R=$(curl -s -u "$AUTH" -X POST -H 'Content-Type: application/json' -d '{"analyte":"LEAD","asOf":"2026-03-20T10:06:00Z"}' "$BASE/api/trace/evaluate")
+check "结果时点前置：仅 1 个阳性" "$(echo "$R" | jval "d['positiveSamples']")" "1"
+check "结果时点前置：首位候选为单次阳性" "$(echo "$R" | jval "d['candidates'][0]['singleObservation']")" "True"
+
+R=$(curl -s -u "$AUTH" -X POST -H 'Content-Type: application/json' -d '{"analyte":"LEAD","purpose":"RISK_COMMUNICATION"}' "$BASE/api/trace/cases/CASE-LEAD-0326/versions")
+VID=$(echo "$R" | jval "d['versionId']")
+check "追溯版本冻结生产图摘要" "$(echo "$R" | jval "len(d['graphSha256'])")" "64"
+check "追溯版本冻结实验结果摘要" "$(echo "$R" | jval "len(d['spectraSha256'])")" "64"
+check "追溯版本非法律定责" "$(echo "$R" | jval "d['legalLiability']")" "False"
+R=$(curl -s -u "$AUTH" "$BASE/api/trace/cases/CASE-LEAD-0326/versions/$VID/verify")
+check "追溯版本可仅凭冻结输入复现" "$(echo "$R" | jval "d['reproducible']")" "True"
+
+R=$(curl -s -u "$AUTH" -X POST "$BASE/api/trace/demo/backfill-usage?rawBatchId=RB-EM-01")
+check "补登批次记录影响 1 条投料" "$(echo "$R" | jval "d['updatedUsages']")" "1"
+R=$(curl -s -u "$AUTH" -X POST -H 'Content-Type: application/json' -d '{"analyte":"LEAD"}' "$BASE/api/trace/evaluate")
+check "补登后展开候选收敛为直接路径" "$(echo "$R" | jval "[c['viaMissingRecord'] for c in d['candidates'] if c['rawBatchId']=='RB-EM-01'][0]")" "False"
+check "补登后另一同辅料批次退出候选" "$(echo "$R" | jval "'RB-EM-02' not in [c['rawBatchId'] for c in d['candidates']]")" "True"
+
+say ""
 say "==============================================="
 say "结果: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] && say "ALL CHECKS PASSED" || say "SOME CHECKS FAILED"

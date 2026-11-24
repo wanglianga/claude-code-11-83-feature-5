@@ -123,5 +123,106 @@ CREATE TABLE IF NOT EXISTS fault_switch (
   timeout_next BOOLEAN NOT NULL DEFAULT FALSE
 );
 
--- 注：入站库与事件账的不可变触发器由 ImmutabilityGuardConfig 在启动时以单语句方式创建
+-- =====================================================================
+-- 食品污染源头候选推导（trace）
+-- 样品账 -> 成品批次 -> 生产线 -> 配方投料 -> 原料批次 -> 供应商
+-- 污染谱账保存化学指纹、检出限与检测不确定度；路径求值器据此生成候选来源与反证。
+-- 所有 trace_* 业务表只记录事实；追溯版本 trace_version 由触发器禁止 UPDATE/DELETE。
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS trace_factory (
+  factory_id  TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  region      TEXT,
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS trace_line (
+  line_id     TEXT PRIMARY KEY,
+  factory_id  TEXT NOT NULL REFERENCES trace_factory(factory_id),
+  name        TEXT NOT NULL,
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS trace_product_batch (
+  product_batch_id TEXT PRIMARY KEY,
+  line_id          TEXT NOT NULL REFERENCES trace_line(line_id),
+  product_code     TEXT NOT NULL,
+  production_start TIMESTAMPTZ NOT NULL,
+  production_end   TIMESTAMPTZ NOT NULL,
+  recorded_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 原料批次：采购/到货区间 + 该批次的化学指纹参考谱
+CREATE TABLE IF NOT EXISTS trace_raw_batch (
+  raw_batch_id    TEXT PRIMARY KEY,
+  ingredient_code TEXT NOT NULL,
+  supplier_id     TEXT NOT NULL,
+  purchase_from   TIMESTAMPTZ,
+  purchase_to     TIMESTAMPTZ,
+  arrival_from    TIMESTAMPTZ,
+  arrival_to      TIMESTAMPTZ,
+  fingerprint     JSONB NOT NULL DEFAULT '{}',
+  recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 配方投料记录；raw_batch_id 为空表示批次记录缺失（会导致候选范围扩张）
+CREATE TABLE IF NOT EXISTS trace_usage (
+  usage_id         BIGSERIAL PRIMARY KEY,
+  product_batch_id TEXT NOT NULL REFERENCES trace_product_batch(product_batch_id),
+  raw_batch_id     TEXT REFERENCES trace_raw_batch(raw_batch_id),
+  ingredient_code  TEXT NOT NULL,
+  used_from        TIMESTAMPTZ,
+  used_to          TIMESTAMPTZ,
+  quantity_kg      NUMERIC,
+  recorded_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trace_usage_pb  ON trace_usage (product_batch_id);
+CREATE INDEX IF NOT EXISTS idx_trace_usage_raw ON trace_usage (raw_batch_id);
+
+-- 样品账：样品键 -> 成品批次（生产线与配方由批次与投料记录关联）
+CREATE TABLE IF NOT EXISTS trace_sample (
+  sample_key       TEXT PRIMARY KEY,
+  product_batch_id TEXT NOT NULL REFERENCES trace_product_batch(product_batch_id),
+  sampled_at       TIMESTAMPTZ NOT NULL,
+  note             TEXT,
+  recorded_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trace_sample_pb ON trace_sample (product_batch_id);
+
+-- 污染谱账：化学指纹 + 检出限 + 检测不确定度；polarity 区分阳性/阴性
+CREATE TABLE IF NOT EXISTS trace_spectrum (
+  spectrum_id            TEXT PRIMARY KEY,
+  sample_key             TEXT NOT NULL REFERENCES trace_sample(sample_key),
+  analyte                TEXT NOT NULL,
+  fingerprint            JSONB NOT NULL DEFAULT '{}',
+  detection_limit        NUMERIC,
+  detection_limit_unit   TEXT,
+  relative_uncertainty   NUMERIC,
+  result_value           NUMERIC,
+  polarity               TEXT NOT NULL,
+  lab                    TEXT,
+  measured_at            TIMESTAMPTZ NOT NULL,
+  recorded_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trace_spectrum_sample  ON trace_spectrum (sample_key);
+CREATE INDEX IF NOT EXISTS idx_trace_spectrum_analyte ON trace_spectrum (analyte);
+
+-- 追溯版本：冻结当时使用的生产图、实验结果与求值输出，供风险沟通而非法律定责
+CREATE TABLE IF NOT EXISTS trace_version (
+  version_id     TEXT PRIMARY KEY,
+  case_id        TEXT NOT NULL,
+  purpose        TEXT NOT NULL,
+  mode           TEXT NOT NULL,
+  analyte        TEXT NOT NULL,
+  as_of          TIMESTAMPTZ,
+  graph_sha256   TEXT NOT NULL,
+  spectra_sha256 TEXT NOT NULL,
+  inputs_sha256  TEXT NOT NULL,
+  payload        JSONB NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trace_version_case ON trace_version (case_id, created_at);
+
+-- 注：入站库、事件账与追溯版本表的不可变触发器由 ImmutabilityGuardConfig 在启动时以单语句方式创建
 -- （PL/pgSQL 函数体含分号，不能放在本脚本中按分号拆分执行）。
